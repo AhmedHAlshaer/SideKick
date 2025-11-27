@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
 from sidekick_tools import playwright_tools, other_tools
+from memory_manager import MemoryManager
 import uuid
 import asyncio
 from datetime import datetime
@@ -25,6 +26,7 @@ class State(TypedDict):
     feedback_on_work: Optional[str]
     success_criteria_met: bool
     user_input_needed: bool
+    relevant_memories: Optional[str]  # Context from long-term memory
 
 
 class EvaluatorOutput(BaseModel):
@@ -35,15 +37,27 @@ class EvaluatorOutput(BaseModel):
     )
 
 
+class MemoryExtractionOutput(BaseModel):
+    """Structured output for extracting facts from conversations."""
+    facts_to_remember: List[str] = Field(
+        description="List of important facts, preferences, or information worth remembering for future conversations"
+    )
+    conversation_summary: str = Field(
+        description="Brief 1-sentence summary of what was discussed"
+    )
+
+
 class Sidekick:
     def __init__(self):
         self.worker_llm_with_tools = None
         self.evaluator_llm_with_output = None
+        self.memory_extractor_llm = None
         self.tools = None
         self.llm_with_tools = None
         self.graph = None
         self.sidekick_id = str(uuid.uuid4())
-        self.memory = MemorySaver()
+        self.memory = MemorySaver()  # Short-term conversation memory
+        self.memory_manager = MemoryManager()  # Long-term memory (NEW!)
         self.browser = None
         self.playwright = None
 
@@ -67,14 +81,29 @@ class Sidekick:
         )
         self.evaluator_llm_with_output = evaluator_llm  # Remove .with_structured_output()
         
+        # Memory extraction LLM (also using JSON mode)
+        memory_extractor = ChatOpenAI(
+            model="deepseek-chat",
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+            model_kwargs={"response_format": {"type": "json_object"}}
+        )
+        self.memory_extractor_llm = memory_extractor
+        
         await self.build_graph()
 
     def worker(self, state: State) -> Dict[str, Any]:
+        # Retrieve relevant memories for context
+        user_message = state["messages"][-1].content if state["messages"] else ""
+        memory_context = self.memory_manager.get_memory_context(user_message)
+        
         system_message = f"""You are a helpful assistant that can use tools to complete tasks.
     You keep working on a task until either you have a question or clarification for the user, or the success criteria is met.
     You have many tools to help you, including tools to browse the internet, navigating and retrieving web pages.
     You have a tool to run python code, but note that you would need to include a print() statement if you wanted to receive output.
     The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+    {memory_context}
 
     This is the success criteria:
     {state["success_criteria"]}
@@ -205,9 +234,71 @@ class Sidekick:
 
     def route_based_on_evaluation(self, state: State) -> str:
         if state["success_criteria_met"] or state["user_input_needed"]:
-            return "END"
+            return "memory_extractor"  # Extract memories before ending
         else:
             return "worker"
+    
+    def memory_extractor(self, state: State) -> Dict[str, Any]:
+        """
+        Extract and store important facts from the conversation.
+        
+        This runs at the end of each successful interaction to build
+        long-term memory about the user and their preferences.
+        """
+        system_message = """You are a memory extraction system. Analyze the conversation and extract important facts worth remembering.
+
+Extract things like:
+- User preferences (e.g., "prefers Python over JavaScript")
+- Important information about the user (e.g., "studies at IU", "works on AI projects")
+- Specific instructions or patterns (e.g., "always wants detailed explanations")
+- Project-specific information (e.g., "working on a Sidekick project")
+- Tools or technologies the user uses
+- Communication style preferences
+
+Do NOT extract:
+- Temporary information (e.g., "today's weather")
+- One-time tasks (e.g., "send email about meeting")
+- Obvious general knowledge
+
+**You must respond with ONLY valid JSON in this exact format:**
+{
+    "facts_to_remember": ["fact 1", "fact 2", ...],
+    "conversation_summary": "Brief 1-sentence summary"
+}
+"""
+        
+        # Format the conversation for analysis
+        conversation = self.format_conversation(state["messages"])
+        
+        user_message = f"""Analyze this conversation and extract important facts:
+
+{conversation}
+
+Remember: Respond with ONLY valid JSON in the format specified above."""
+        
+        messages = [
+            SystemMessage(content=system_message),
+            HumanMessage(content=user_message)
+        ]
+        
+        try:
+            # Get extraction
+            response = self.memory_extractor_llm.invoke(messages)
+            result = json.loads(response.content)
+            
+            facts = result.get("facts_to_remember", [])
+            summary = result.get("conversation_summary", "Conversation")
+            
+            # Store facts in long-term memory
+            if facts:
+                self.memory_manager.store_conversation_facts(summary, facts)
+                print(f"💾 Stored {len(facts)} new memories!")
+            
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠️ Memory extraction error: {e}")
+        
+        # Don't modify state, just pass through
+        return {}
 
     async def build_graph(self):
         # Set up Graph Builder with State
@@ -217,6 +308,7 @@ class Sidekick:
         graph_builder.add_node("worker", self.worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
         graph_builder.add_node("evaluator", self.evaluator)
+        graph_builder.add_node("memory_extractor", self.memory_extractor)
 
         # Add edges
         graph_builder.add_conditional_edges(
@@ -224,14 +316,21 @@ class Sidekick:
         )
         graph_builder.add_edge("tools", "worker")
         graph_builder.add_conditional_edges(
-            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
+            "evaluator", self.route_based_on_evaluation, 
+            {"worker": "worker", "memory_extractor": "memory_extractor"}
         )
+        # After extracting memories, end the conversation
+        graph_builder.add_edge("memory_extractor", END)
         graph_builder.add_edge(START, "worker")
 
         # Compile the graph
         self.graph = graph_builder.compile(checkpointer=self.memory)
 
-    async def run_superstep(self, message, success_criteria, history):
+    async def run_superstep_streaming(self, message, success_criteria, history):
+        """
+        Run a task with streaming updates for real-time feedback.
+        Yields status updates as the agent works through the workflow.
+        """
         config = {"configurable": {"thread_id": self.sidekick_id}}
 
         state = {
@@ -240,12 +339,105 @@ class Sidekick:
             "feedback_on_work": None,
             "success_criteria_met": False,
             "user_input_needed": False,
+            "relevant_memories": None,
+        }
+        
+        # Add user message to history immediately
+        user = {"role": "user", "content": message}
+        current_history = history + [user]
+        
+        # Initialize streaming response
+        streaming_message = {"role": "assistant", "content": ""}
+        assistant_content = ""
+        last_status = ""
+        
+        # Stream through the graph
+        async for event in self.graph.astream(state, config=config):
+            # Extract node name and data
+            for node_name, node_data in event.items():
+                status_message = ""
+                
+                if node_name == "worker":
+                    # Worker is thinking/responding
+                    if "messages" in node_data and node_data["messages"]:
+                        last_msg = node_data["messages"][-1]
+                        
+                        # Check if making tool calls
+                        if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                            tool_names = [tc.get('name', 'unknown') for tc in last_msg.tool_calls]
+                            status_message = f"🔧 Using tools: {', '.join(tool_names)}..."
+                        elif hasattr(last_msg, 'content') and last_msg.content and not hasattr(last_msg, 'tool_calls'):
+                            # Worker has produced a response
+                            if isinstance(last_msg, AIMessage):
+                                assistant_content = last_msg.content
+                                status_message = f"{assistant_content}\n\n⏳ Processing..."
+                            else:
+                                status_message = "🤔 Analyzing task..."
+                        else:
+                            status_message = "🤔 Thinking..."
+                
+                elif node_name == "tools":
+                    # Tools are executing
+                    status_message = "⚙️ Executing actions..."
+                
+                elif node_name == "evaluator":
+                    # Evaluating results
+                    if assistant_content:
+                        status_message = f"{assistant_content}\n\n✅ Reviewing results..."
+                    else:
+                        status_message = "✅ Evaluating work..."
+                
+                elif node_name == "memory_extractor":
+                    # Storing memories (final step)
+                    if assistant_content:
+                        status_message = f"{assistant_content}\n\n💾 Saving to memory..."
+                    else:
+                        status_message = "💾 Saving to memory..."
+                
+                # Only yield if status changed (avoid duplicate updates)
+                if status_message and status_message != last_status:
+                    streaming_message["content"] = status_message
+                    last_status = status_message
+                    yield current_history + [streaming_message]
+        
+        # Get final clean result (without status indicators)
+        if assistant_content:
+            streaming_message["content"] = assistant_content
+        else:
+            # Fallback: try to get from final state
+            final_state = await self.graph.aget_state(config)
+            if final_state.values.get("messages"):
+                # Find the actual assistant response (not evaluator feedback)
+                for msg in reversed(final_state.values["messages"]):
+                    if hasattr(msg, 'content') and msg.content:
+                        content = msg.content
+                        if not content.startswith("Evaluator Feedback"):
+                            if isinstance(msg, AIMessage):
+                                assistant_content = content
+                                break
+                streaming_message["content"] = assistant_content if assistant_content else "Task completed."
+        
+        # Final yield with clean response (no status indicators)
+        yield current_history + [streaming_message]
+    
+    async def run_superstep(self, message, success_criteria, history):
+        """Legacy non-streaming method - kept for compatibility"""
+        config = {"configurable": {"thread_id": self.sidekick_id}}
+
+        state = {
+            "messages": message,
+            "success_criteria": success_criteria or "The answer should be clear and accurate",
+            "feedback_on_work": None,
+            "success_criteria_met": False,
+            "user_input_needed": False,
+            "relevant_memories": None,
         }
         result = await self.graph.ainvoke(state, config=config)
         user = {"role": "user", "content": message}
         reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+        # feedback is internal only - don't show to user
+        # feedback = {"role": "assistant", "content": result["messages"][-1].content}
+        return history + [user, reply]  # Only show user's message and assistant's reply
 
     def cleanup(self):
         if self.browser:
