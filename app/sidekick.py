@@ -11,11 +11,13 @@ from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
 from sidekick_tools import playwright_tools, other_tools
 from memory_manager import MemoryManager
+from sheets_logger import get_sheets_logger
 import uuid
 import asyncio
 from datetime import datetime
 import os 
 import json  # Add if not already there
+import time
 
 load_dotenv(override=True)
 
@@ -58,6 +60,7 @@ class Sidekick:
         self.sidekick_id = str(uuid.uuid4())
         self.memory = MemorySaver()  # Short-term conversation memory
         self.memory_manager = MemoryManager()  # Long-term memory (NEW!)
+        self.sheets_logger = get_sheets_logger()  # Google Sheets logging
         self.browser = None
         self.playwright = None
 
@@ -331,6 +334,9 @@ Remember: Respond with ONLY valid JSON in the format specified above."""
         Run a task with streaming updates for real-time feedback.
         Yields status updates as the agent works through the workflow.
         """
+        # Start timing for duration tracking
+        start_time = time.time()
+        
         config = {"configurable": {"thread_id": self.sidekick_id}}
 
         state = {
@@ -350,6 +356,7 @@ Remember: Respond with ONLY valid JSON in the format specified above."""
         streaming_message = {"role": "assistant", "content": ""}
         assistant_content = ""
         last_status = ""
+        tools_used = []  # Track tools used during this turn
         
         # Stream through the graph
         async for event in self.graph.astream(state, config=config):
@@ -365,6 +372,7 @@ Remember: Respond with ONLY valid JSON in the format specified above."""
                         # Check if making tool calls
                         if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
                             tool_names = [tc.get('name', 'unknown') for tc in last_msg.tool_calls]
+                            tools_used.extend(tool_names)  # Track tools used
                             status_message = f"🔧 Using tools: {', '.join(tool_names)}..."
                         elif hasattr(last_msg, 'content') and last_msg.content and not hasattr(last_msg, 'tool_calls'):
                             # Worker has produced a response
@@ -416,6 +424,34 @@ Remember: Respond with ONLY valid JSON in the format specified above."""
                                 assistant_content = content
                                 break
                 streaming_message["content"] = assistant_content if assistant_content else "Task completed."
+        
+        # Calculate duration
+        duration = time.time() - start_time
+        
+        # Get final state for logging metadata
+        final_state = await self.graph.aget_state(config)
+        success_met = final_state.values.get("success_criteria_met", False)
+        user_input_needed = final_state.values.get("user_input_needed", False)
+        
+        # Log to Google Sheets
+        try:
+            # Calculate turn number
+            turn_number = len([msg for msg in current_history if msg.get("role") == "user"])
+            
+            self.sheets_logger.log_conversation_turn(
+                session_id=self.sidekick_id,
+                user_message=message,
+                assistant_response=assistant_content,
+                success_criteria=success_criteria or "The answer should be clear and accurate",
+                tools_used=list(set(tools_used)),  # Unique tools only
+                status="completed",
+                success_met=success_met,
+                user_input_needed=user_input_needed,
+                turn_number=turn_number,
+                duration=duration
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to log conversation: {e}")
         
         # Final yield with clean response (no status indicators)
         yield current_history + [streaming_message]

@@ -11,6 +11,7 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
+from mathgrader.tools import get_grading_tools
 
 
 
@@ -83,6 +84,7 @@ async def other_tools():
     wiki_tool = WikipediaQueryRun(api_wrapper=wikipedia)
 
     python_repl = PythonREPLTool()
+    grading_tools = get_grading_tools()
     
-    return file_tools + [push_tool, email_tool, tool_search,  wiki_tool]
+    return file_tools + [push_tool, email_tool, tool_search,  wiki_tool] + grading_tools
 
